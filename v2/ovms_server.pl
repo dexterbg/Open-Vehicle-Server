@@ -7,6 +7,8 @@ use AnyEvent::Socket;
 use AnyEvent::HTTP;
 use AnyEvent::HTTPD;
 use IO::Handle;
+use Net::SSLeay;
+use IO::Socket::SSL;
 use AnyEvent::Log;
 use Config::IniFiles;
 use DBI;
@@ -33,7 +35,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.6.5-20200220";
+my $VERSION = "2.6.5-20201214";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -101,7 +103,7 @@ my $notifyhistory_tim = $config->val('push','history',0);              # Retain 
 my $mqtt_superuser    = $config->val('mqtt','superuser');              # MQTT superuser
 
 # User password encoding function:
-my $pw_check         = $config->val('db','pw_check','drupal_password_check($passwordhash,$password)');
+my $pw_encode        = $config->val('db','pw_encode','drupal_password($password)');
 
 # Database ticker
 $db = DBI->connect($config->val('db','path'),$config->val('db','user'),$config->val('db','pass'));
@@ -111,6 +113,7 @@ if (!defined $db)
   exit(1);
   }
 $db->{mysql_auto_reconnect} = 1;
+$db->do("SET NAMES utf8mb4");
 my $dbtim = AnyEvent->timer (after => 60, interval => 60, cb => \&db_tim);
 
 # Apple push notifications ticker:
@@ -917,6 +920,7 @@ sub io_message
   elsif ($code eq 'p') ## PUSH SUBSCRIPTION
     {
     my ($appid,$pushtype,$pushkeytype,@vkeys) = split /,/,$data;
+    $pushkeytype='production' if ($pushtype eq 'apns'); ## apns sandbox no longer used
     $conns{$fn}{'appid'} = $appid;
     while (scalar @vkeys > 0)
       {
@@ -1650,6 +1654,7 @@ sub apns_tim
       }
     else
       {
+      AE::log info => "- - - msg apns connected to $host, now establishing SSL security";
       $apns_handle = new AnyEvent::Handle(
           fh       => $fh,
           peername => $host,
@@ -1680,6 +1685,11 @@ sub apns_tim
                 $_[0]->destroy;
                 }
           );
+      if (!defined $apns_handle)
+        {
+        AE::log error => "- - - msg apns processing ERROR handle could not be created";
+        $apns_running = 0;
+        }
       }
     }
   }
@@ -1783,8 +1793,8 @@ sub http_request_api_cookie_login
     if (defined $row)
       {
       my $passwordhash = $row->{'pass'};
-      my $ok = eval $pw_check;
-      if ($ok)
+      my $encoded = eval $pw_encode;
+      if ($encoded eq $passwordhash)
         {
         # Password ok
         my $ug = new Data::UUID;
@@ -2460,9 +2470,7 @@ sub http_request_in_mqapi_auth
     if (defined $row)
       {
       my $passwordhash = $row->{'pass'};
-      my $password = $p_password;
-      my $ok = eval $pw_check;
-      if ($ok)
+      if (&drupal_password_check($passwordhash, $p_password))
         {
         AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'mqapi/auth',$p_username,'SUCCESS');
         $req->respond ( [200, 'Authentication OK', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, ''] );
@@ -2775,6 +2783,28 @@ sub drupal_password_base64_encode
   } while ($i < $count);
 
   return $output;
+  }
+
+sub drupal_password
+  {
+  my ($password) = @_;
+
+  my $iter_log2 = index($itoa64,substr($ph,3,1));
+  my $iter_count = 1 << $iter_log2;
+
+  my $phash = substr($ph,0,12);
+  my $salt = substr($ph,4,8);
+
+  my $hash = sha512($salt.$password);
+  do
+    {
+    $hash = sha512($hash.$password);
+    $iter_count--;
+    } while ($iter_count > 0);
+
+  my $encoded = substr($phash . &drupal_password_base64_encode($hash,length($hash)),0,55);
+
+  return $encoded;
   }
 
 sub drupal_password_base64_encode
