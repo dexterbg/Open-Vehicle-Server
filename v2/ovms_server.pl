@@ -27,6 +27,7 @@ use Socket qw(SOL_SOCKET SO_KEEPALIVE);
 use Email::MIME;
 use Email::Sender::Simple qw(sendmail);
 use POSIX qw(strftime);
+use Time::Piece;
 
 use constant SOL_TCP => 6;
 use constant TCP_KEEPIDLE => 4;
@@ -35,7 +36,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.6.5-20201214";
+my $VERSION = "2.7.0-20210511";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -421,6 +422,12 @@ sub io_line
 
   }
 
+sub AppConnectionCount
+  {
+  my ($vehicleid) = @_;
+  return (defined $app_conns{$vehicleid}) ? (scalar keys %{$app_conns{$vehicleid}}) : 0;
+  }
+
 sub io_login
   {
   my ($fn,$hdl,$vehicleid,$clienttype,$rest) = @_;
@@ -529,8 +536,7 @@ sub io_login
     &io_tx_apps($vehicleid, 'Z', '1');
     &io_tx_btcs($vehicleid, 'Z', '1');
     # And notify the car itself about listening apps
-    my $appcount = (defined $app_conns{$vehicleid})?(scalar keys %{$app_conns{$vehicleid}}):0;
-    &io_tx($fn, $hdl, 'Z', $appcount);
+    &io_tx($fn, $hdl, 'Z', AppConnectionCount($vehicleid));
     }
   }
 
@@ -563,7 +569,7 @@ sub io_terminate
       &io_cleanup_cmdqueue($fn,"A",$vehicleid);
       delete $app_conns{$vehicleid}{$fn};
       # Notify car about new app count
-      &io_tx_car($vehicleid, 'Z', scalar keys %{$app_conns{$vehicleid}});
+      &io_tx_car($vehicleid, 'Z', AppConnectionCount($vehicleid));
       # Cleanup group messages
       if (defined $conns{$fn}{'appgroups'})
         {
@@ -614,7 +620,7 @@ sub io_tx
   {
   my ($fn, $handle, $code, $data) = @_;
 
-  return if ($handle->destroyed);
+  return if (!defined $handle || $handle->destroyed);
 
   my $vid = $conns{$fn}{'vehicleid'};
   my $clienttype = $conns{$fn}{'clienttype'}; $clienttype='-' if (!defined $clienttype);
@@ -1825,13 +1831,32 @@ sub http_request_api_cookie_login
   $httpd->stop_request;
   }
 
+# Delete an API session
+sub api_delete_session
+  {
+  my ($session) = @_;
+
+  # Disconnect API APPs:
+  foreach (keys %{$api_conns{$session}{'vehicles'}})
+    {
+    my $vehicleid = $_;
+    if (defined($app_conns{$vehicleid}{'API:'.$session}))
+      {
+      delete $app_conns{$vehicleid}{'API:'.$session};
+      &io_tx_car($vehicleid, 'Z', AppConnectionCount($vehicleid));
+      }
+    }
+
+  delete $api_conns{$session};
+  }
+
 # DELETE  /api/cookie                             Delete the session cookie and logout
 INIT { $http_request_api_auth{'DELETE:cookie'} = \&http_request_api_cookie_logout; }
 sub http_request_api_cookie_logout
   {
   my ($httpd,$req,$session,@rest) = @_;
 
-  delete $api_conns{$session};
+  api_delete_session($session);
 
   AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'session destroyed (on request)');
 
@@ -1903,7 +1928,43 @@ sub http_request_api_vehicle_get
   {
   my ($httpd,$req,$session,@rest) = @_;
 
-  $req->respond ( [404, 'Not yet implemented', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Not yet implemented\n"] );
+  my ($vehicleid) = @rest;
+
+  # Verify session:
+  if ((!defined $vehicleid)||(!defined $api_conns{$session}{'vehicles'}{$vehicleid}))
+    {
+    AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'Forbidden access',$vehicleid);
+    $req->respond ( [404, 'Forbidden', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Forbidden\n"] );
+    $httpd->stop_request;
+    return;
+    }
+
+  my %result;
+
+  # Register API APP login:
+  AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'Vehicle connect',$vehicleid);
+  my $prevappcnt = AppConnectionCount($vehicleid);
+  $app_conns{$vehicleid}{'API:'.$session} = $session;
+
+  # Notify car:
+  &io_tx_car($vehicleid, 'Z', AppConnectionCount($vehicleid));
+
+  # Return peer status:
+  $result{'v_net_connected'} = (defined $car_conns{$vehicleid}) ? 1 : 0;
+  $result{'v_apps_connected'} = scalar keys %{$app_conns{$vehicleid}};
+  $result{'v_btcs_connected'} = scalar keys %{$btc_conns{$vehicleid}};
+  $result{'v_first_peer'} = ($prevappcnt == 0) ? 1 : 0;
+
+  my $rec = &api_vehiclerecord($vehicleid,'S');
+  if (defined $rec && defined $rec->{'m_msgtime'})
+    {
+    my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_s'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_s'} = time() - $t->epoch;
+    }
+
+  my $json = JSON::XS->new->utf8->canonical->encode (\%result) . "\n";
+  $req->respond ( [200, 'Vehicle connected', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
   $httpd->stop_request;
   }
 
@@ -1913,7 +1974,25 @@ sub http_request_api_vehicle_delete
   {
   my ($httpd,$req,$session,@rest) = @_;
 
-  $req->respond ( [404, 'Not yet implemented', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Not yet implemented\n"] );
+  my ($vehicleid) = @rest;
+
+  # Verify session:
+  if ((!defined $vehicleid)||(!defined $api_conns{$session}{'vehicles'}{$vehicleid}))
+    {
+    AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'Forbidden access',$vehicleid);
+    $req->respond ( [404, 'Forbidden', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Forbidden\n"] );
+    $httpd->stop_request;
+    return;
+    }
+
+  # Logout API APP:
+  AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'Vehicle disconnect',$vehicleid);
+  delete $app_conns{$vehicleid}{'API:'.$session};
+
+  # Notify car:
+  &io_tx_car($vehicleid, 'Z', AppConnectionCount($vehicleid));
+
+  $req->respond ( [200, 'Vehicle disconnected', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, "Disconnect OK\n"] );
   $httpd->stop_request;
   }
 
@@ -1946,10 +2025,14 @@ sub http_request_api_status
     my ($soc,$units,$linevoltage,$chargecurrent,$chargestate,$chargemode,$idealrange,$estimatedrange,
         $chargelimit,$chargeduration,$chargeb4,$chargekwh,$chargesubstate,$chargestateN,$chargemodeN,
         $chargetimer,$chargestarttime,$chargetimerstale,$cac100,
-		$charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
-		$cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
-		$charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max,
-		$chargetype,$chargepower,$battvoltage,$soh) = split /,/,$rec->{'m_msg'};
+        $charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
+        $cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
+        $charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max,
+        $chargetype,$chargepower,$battvoltage,$soh,$chargepowerinput,$chargerefficiency)
+        = split /,/,$rec->{'m_msg'};
+    my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_s'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_s'} = time() - $t->epoch;
     $result{'soc'} = $soc;
     $result{'units'} = $units;
     $result{'idealrange'} = $idealrange;
@@ -1960,6 +2043,8 @@ sub http_request_api_status
     $result{'cac100'} = $cac100;
     $result{'soh'} = $soh;
     $result{'cooldown_active'} = $cooldown_active;
+    $result{'chargepowerinput'} = $chargepowerinput;
+    $result{'chargerefficiency'} = $chargerefficiency;
     }
   $rec= &api_vehiclerecord($vehicleid,'D');
   if (defined $rec)
@@ -1967,7 +2052,11 @@ sub http_request_api_status
     if (! $rec->{'m_paranoid'})
       {
       my ($doors1,$doors2,$lockunlock,$tpem,$tmotor,$tbattery,$trip,$odometer,$speed,$parktimer,$ambient,
-          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger,$vehicle12v_current) = split /,/,$rec->{'m_msg'};
+          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger,
+          $vehicle12v_current,$cabin_temp) = split /,/,$rec->{'m_msg'};
+      my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+      $result{'m_msgtime_d'} = $rec->{'m_msgtime'};
+      $result{'m_msgage_d'} = time() - $t->epoch;
       $result{'fl_dooropen'} =   $doors1 & 0b00000001;
       $result{'fr_dooropen'} =   $doors1 & 0b00000010;
       $result{'cp_dooropen'} =   $doors1 & 0b00000100;
@@ -1983,6 +2072,7 @@ sub http_request_api_status
       $result{'temperature_motor'} = $tmotor;
       $result{'temperature_battery'} = $tbattery;
       $result{'temperature_charger'} = $tcharger;
+      $result{'temperature_cabin'} = $cabin_temp;
       $result{'tripmeter'} = $trip;
       $result{'odometer'} = $odometer;
       $result{'speed'} = $speed;
@@ -2031,6 +2121,9 @@ sub http_request_api_tpms
       return;
       }
     my ($fr_pressure,$fr_temp,$rr_pressure,$rr_temp,$fl_pressure,$fl_temp,$rl_pressure,$rl_temp,$staletpms) = split /,/,$rec->{'m_msg'};
+    my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_w'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_w'} = time() - $t->epoch;
     $result{'fr_pressure'} = $fr_pressure;
     $result{'fr_temperature'} = $fr_temp;
     $result{'rr_pressure'} = $rr_pressure;
@@ -2075,6 +2168,9 @@ sub http_request_api_location
       }
     my ($latitude,$longitude,$direction,$altitude,$gpslock,$stalegps,$speed,$tripmeter,
       $drivemode,$power,$energyused,$energyrecd) = split /,/,$rec->{'m_msg'};
+    my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_l'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_l'} = time() - $t->epoch;
     $result{'latitude'} = $latitude;
     $result{'longitude'} = $longitude;
     $result{'direction'} = $direction;
@@ -2123,14 +2219,20 @@ sub http_request_api_charge_get
     my ($soc,$units,$linevoltage,$chargecurrent,$chargestate,$chargemode,$idealrange,$estimatedrange,
         $chargelimit,$chargeduration,$chargeb4,$chargekwh,$chargesubstate,$chargestateN,$chargemodeN,
         $chargetimer,$chargestarttime,$chargetimerstale,$cac100,
-		$charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
-		$cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
-		$charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max,
-		$chargetype,$chargepower,$battvoltage,$soh) = split /,/,$rec->{'m_msg'};
+        $charge_etr_full,$charge_etr_limit,$charge_limit_range,$charge_limit_soc,
+        $cooldown_active,$cooldown_tbattery,$cooldown_timelimit,
+        $charge_estimate,$charge_etr_range,$charge_etr_soc,$idealrange_max,
+        $chargetype,$chargepower,$battvoltage,$soh,$chargepowerinput,$chargerefficiency)
+        = split /,/,$rec->{'m_msg'};
+    my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_s'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_s'} = time() - $t->epoch;
     $result{'linevoltage'} = $linevoltage;
     $result{'battvoltage'} = $battvoltage;
     $result{'chargecurrent'} = $chargecurrent;
     $result{'chargepower'} = $chargepower;
+    $result{'chargepowerinput'} = $chargepowerinput;
+    $result{'chargerefficiency'} = $chargerefficiency;
     $result{'chargetype'} = $chargetype;
     $result{'chargestate'} = $chargestate;
     $result{'soc'} = $soc;
@@ -2166,7 +2268,12 @@ sub http_request_api_charge_get
     if (! $rec->{'m_paranoid'})
       {
       my ($doors1,$doors2,$lockunlock,$tpem,$tmotor,$tbattery,$trip,$odometer,$speed,$parktimer,$ambient,
-          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger,$vehicle12v_current) = split /,/,$rec->{'m_msg'};
+          $doors3,$staletemps,$staleambient,$vehicle12v,$doors4,$vehicle12v_ref,$doors5,$tcharger,
+          $vehicle12v_current,$cabin_temp)
+          = split /,/,$rec->{'m_msg'};
+      my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+      $result{'m_msgtime_d'} = $rec->{'m_msgtime'};
+      $result{'m_msgage_d'} = time() - $t->epoch;
       $result{'cp_dooropen'} =   $doors1 & 0b00000100;
       $result{'pilotpresent'} =  $doors1 & 0b00001000;
       $result{'charging'} =      $doors1 & 0b00010000;
@@ -2176,6 +2283,7 @@ sub http_request_api_charge_get
       $result{'temperature_battery'} = $tbattery;
       $result{'temperature_charger'} = $tcharger;
       $result{'temperature_ambient'} = $ambient;
+      $result{'temperature_cabin'} = $cabin_temp;
       $result{'carawake'} =      $doors3 & 0b00000010;
       $result{'staletemps'} = $staletemps;
       $result{'staleambient'} = $staleambient;
@@ -2571,7 +2679,7 @@ sub api_tim
 
     if ($lastused < $expire)
       {
-      delete $api_conns{$session};
+      api_delete_session($session);
       AE::log info => join(' ','http','-',$session,'-','session timeout');
       }
     }
