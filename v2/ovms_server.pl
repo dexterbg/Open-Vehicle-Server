@@ -1,5 +1,7 @@
 #!/usr/bin/perl
 
+use utf8;
+
 use EV;
 use AnyEvent;
 use AnyEvent::Handle;
@@ -708,7 +710,7 @@ if (-e 'ovms_server.pem')
     my $handle; $handle = new AnyEvent::Handle(
       fh => $fh,
       tls      => "accept",
-      tls_ctx  => { cert_file => "ovms_server.pem" },
+      tls_ctx  => { cert_file => "ovms_server.pem", sslv3 => 0, verify => 0 },
       on_error => \&io_error,
       on_rtimeout => \&io_timeout,
       keepalive => 1,
