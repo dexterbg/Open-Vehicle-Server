@@ -38,7 +38,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.7.0-20210511";
+my $VERSION = "2.7.0-20230110";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -243,12 +243,19 @@ sub io_line
   my ($hdl, $line) = @_;
 
   my $fn = $hdl->fh->fileno();
+
+  if (!defined $conns{$fn})
+    {
+    AE::log warn => "#$fn - - message line received after disconnection - ignore"; 
+    return;
+    }
+
   my $vid = $conns{$fn}{'vehicleid'}; $vid='-' if (!defined $vid);
   my $clienttype = $conns{$fn}{'clienttype'}; $clienttype='-' if (!defined $clienttype);
   $utilisations{$vid.'-'.$clienttype}{'rx'} += length($line)+2;
   $utilisations{$vid.'-'.$clienttype}{'vid'} = $vid;
   $utilisations{$vid.'-'.$clienttype}{'clienttype'} = $clienttype;
-  AE::log debug => "#$fn $clienttype $vid rx enc $line";
+  AE::log trace => "#$fn $clienttype $vid rx enc $line";
   $hdl->push_read(line => \&io_line);
   $conns{$fn}{'lastrx'} = time;
 
@@ -407,7 +414,7 @@ sub io_line
     if ($message =~ /^MP-0\s(\S)(.*)/)
       {
       my ($code,$data) = ($1,$2);
-      &log($fn, $clienttype, $vid, "rx msg $code $data");
+      &log($fn, $clienttype, $vid, "rx msg $code $data", ($code =~ /[cC]/) ? "info" : "debug");
       &io_message($fn, $hdl, $conns{$fn}{'vehicleid'}, $vrec, $code, $data);
       }
     else
@@ -434,7 +441,7 @@ sub io_login
   {
   my ($fn,$hdl,$vehicleid,$clienttype,$rest) = @_;
 
-  &log($fn, $clienttype, $vehicleid, "got login");
+  &log($fn, $clienttype, $vehicleid, "got login", "info");
 
   if ($clienttype eq 'A')
     {
@@ -627,8 +634,8 @@ sub io_tx
   my $vid = $conns{$fn}{'vehicleid'};
   my $clienttype = $conns{$fn}{'clienttype'}; $clienttype='-' if (!defined $clienttype);
   my $encoded = encode_base64($conns{$fn}{'txcipher'}->RC4("MP-0 $code$data"),'');
-  AE::log debug => "#$fn $clienttype $vid tx enc $encoded";
-  AE::log info => "#$fn $clienttype $vid tx msg $code $data";
+  AE::log trace => "#$fn $clienttype $vid tx enc $encoded";
+  AE::log debug => "#$fn $clienttype $vid tx msg $code $data";
   $utilisations{$vid.'-'.$clienttype}{'tx'} += length($encoded)+2 if ($vid ne '-');
   $utilisations{$vid.'-'.$clienttype}{'vid'} = $vid;
   $utilisations{$vid.'-'.$clienttype}{'clienttype'} = $clienttype;
@@ -644,7 +651,20 @@ sub io_tx_car
   my $cfn = $car_conns{$vehicleid};
   if (defined $cfn)
     {
-    &io_tx($cfn, $conns{$cfn}{'handle'}, $code, $data);
+    if (!defined $conns{$cfn})
+      {
+      AE::log debug => "#$cfn C $vehicleid io_tx skip: connection terminated";
+      }
+    elsif ($conns{$cfn}{'vehicleid'} ne $vehicleid)
+      {
+      my $conclienttype = $conns{$cfn}{'clienttype'};
+      my $convehicleid = $conns{$cfn}{'vehicleid'};
+      AE::log warn => "#$cfn C $vehicleid io_tx skip: connection mismatch $conclienttype/$convehicleid";
+      }
+    else
+      {
+      &io_tx($cfn, $conns{$cfn}{'handle'}, $code, $data);
+      }
     }
   }
 
@@ -656,7 +676,20 @@ sub io_tx_apps
   foreach (keys %{$app_conns{$vehicleid}})
     {
     my $afn = $_;
-    &io_tx($afn, $conns{$afn}{'handle'}, $code, $data);
+    if (!defined $conns{$afn})
+      {
+      AE::log debug => "#$afn A $vehicleid io_tx skip: connection terminated";
+      }
+    elsif ($conns{$afn}{'vehicleid'} ne $vehicleid)
+      {
+      my $conclienttype = $conns{$afn}{'clienttype'};
+      my $convehicleid = $conns{$afn}{'vehicleid'};
+      AE::log warn => "#$afn A $vehicleid io_tx skip: connection mismatch $conclienttype/$convehicleid";
+      }
+    else
+      {
+      &io_tx($afn, $conns{$afn}{'handle'}, $code, $data);
+      }
     }
   }
 
@@ -668,7 +701,20 @@ sub io_tx_btcs
   foreach (keys %{$btc_conns{$vehicleid}})
     {
     my $afn = $_;
-    &io_tx($afn, $conns{$afn}{'handle'}, $code, $data);
+    if (!defined $conns{$afn})
+      {
+      AE::log debug => "#$afn B $vehicleid io_tx skip: connection terminated";
+      }
+    elsif ($conns{$afn}{'vehicleid'} ne $vehicleid)
+      {
+      my $conclienttype = $conns{$afn}{'clienttype'};
+      my $convehicleid = $conns{$afn}{'vehicleid'};
+      AE::log warn => "#$afn B $vehicleid io_tx skip: connection mismatch $conclienttype/$convehicleid";
+      }
+    else
+      {
+      &io_tx($afn, $conns{$afn}{'handle'}, $code, $data);
+      }
     }
   }
 
@@ -684,7 +730,8 @@ tcp_server undef, 6867, sub
   $fh->blocking(0);
   my $fn = $fh->fileno();
   AE::log info => "#$fn - new ovms connection from $host:$port";
-  my $handle; $handle = new AnyEvent::Handle(fh => $fh, on_error => \&io_error, on_rtimeout => \&io_timeout, keepalive => 1, no_delay => 1, rtimeout => 30);
+  my $handle;
+  $handle = new AnyEvent::Handle(fh => $fh, on_error => \&io_error, on_rtimeout => \&io_timeout, keepalive => 1, no_delay => 1, rtimeout => 30);
   $handle->push_read (line => \&io_line);
 
   setsockopt($fh, SOL_SOCKET, SO_KEEPALIVE, 1);
@@ -692,6 +739,7 @@ tcp_server undef, 6867, sub
   setsockopt($fh, SOL_TCP, TCP_KEEPIDLE, 240);
   setsockopt($fh, SOL_TCP, TCP_KEEPINTVL, 240);
 
+  delete $conns{$fn};          # Clean-up any residual data for this connection
   $conns{$fn}{'fh'} = $fh;
   $conns{$fn}{'handle'} = $handle;
   $conns{$fn}{'host'} = $host;
@@ -707,7 +755,8 @@ if (-e 'ovms_server.pem')
     $fh->blocking(0);
     my $fn = $fh->fileno();
     AE::log info => "#$fn - new TLS ovms connection from $host:$port";
-    my $handle; $handle = new AnyEvent::Handle(
+    my $handle;
+    $handle = new AnyEvent::Handle(
       fh => $fh,
       tls      => "accept",
       tls_ctx  => { cert_file => "ovms_server.pem", sslv3 => 0, verify => 0 },
@@ -723,6 +772,7 @@ if (-e 'ovms_server.pem')
     setsockopt($fh, SOL_TCP, TCP_KEEPIDLE, 240);
     setsockopt($fh, SOL_TCP, TCP_KEEPINTVL, 240);
 
+    delete $conns{$fn};          # Clean-up any residual data for this connection
     $conns{$fn}{'fh'} = $fh;
     $conns{$fn}{'handle'} = $handle;
     $conns{$fn}{'host'} = $host;
@@ -749,13 +799,13 @@ $http_server->reg_cb (
 $http_server->reg_cb (
                 client_connected => sub {
                   my ($httpd, $host, $port) = @_;
-                    AE::log info => join(' ','http','-','-',$host.':'.$port,'connect');
+                    AE::log trace => join(' ','http','-','-',$host.':'.$port,'connect');
                   }
                 );
 $http_server->reg_cb (
                 client_disconnected => sub {
                   my ($httpd, $host, $port) = @_;
-                    AE::log info => join(' ','http','-','-',$host.':'.$port,'disconnect');
+                    AE::log trace => join(' ','http','-','-',$host.':'.$port,'disconnect');
                   }
                 );
 
@@ -775,13 +825,13 @@ if (-e 'ovms_server.pem')
   $https_server->reg_cb (
                    client_connected => sub {
                      my ($httpd, $host, $port) = @_;
-                       AE::log info => join(' ','http','-','-',$host.':'.$port,'connect(ssl)');
+                       AE::log trace => join(' ','http','-','-',$host.':'.$port,'connect(ssl)');
                       }
                    );
   $https_server->reg_cb (
                    client_disconnected => sub {
                      my ($httpd, $host, $port) = @_;
-                       AE::log info => join(' ','http','-','-',$host.':'.$port,'disconnect(ssl)');
+                       AE::log trace => join(' ','http','-','-',$host.':'.$port,'disconnect(ssl)');
                      }
                   );
   }
@@ -939,7 +989,7 @@ sub io_message
       my $vk_rec = &db_get_vehicle($vk_vehicleid);
       if ((defined $vk_rec)&&($vk_rec->{'carpass'} eq $vk_netpass))
         {
-        AE::log info => "#$fn $clienttype $vehicleid msg push subscription $vk_vehicleid:$pushtype/$pushkeytype => $vk_pushkeyvalue";
+        AE::log debug => "#$fn $clienttype $vehicleid msg push subscription $vk_vehicleid:$pushtype/$pushkeytype => $vk_pushkeyvalue";
         $db->do("INSERT INTO ovms_notifies (vehicleid,appid,pushtype,pushkeytype,pushkeyvalue,lastupdated) "
               . "VALUES (?,?,?,?,?,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE "
               . "lastupdated=UTC_TIMESTAMP(), pushkeytype=?, pushkeyvalue=?",
@@ -1212,7 +1262,7 @@ sub io_message
       }
     $db->do("UPDATE ovms_cars SET v_lastupdate=UTC_TIMESTAMP() WHERE vehicleid=?",undef,$vehicleid);
     # And send it on to the apps...
-    AE::log debug => "#$fn $clienttype $vehicleid msg handle $m_code $m_data";
+    AE::log trace => "#$fn $clienttype $vehicleid msg handle $m_code $m_data";
     &io_tx_apps($vehicleid, $code, $data);
     &io_tx_btcs($vehicleid, $code, $data);
     if ($m_code eq "F")
@@ -1604,7 +1654,7 @@ sub apns_push
     }
 
   my $fn = $hdl->fh->fileno();
-  AE::log info => "#$fn - - connected to apns for push notification";
+  AE::log debug => "#$fn - - connected to apns for push notification";
 
   foreach my $rec (@apns_queue)
     {
@@ -1613,7 +1663,7 @@ sub apns_push
     my $alertmsg = $rec->{'alertmsg'};
     my $pushkeyvalue = $rec->{'pushkeyvalue'};
     my $appid = $rec->{'appid'};
-    AE::log info => "#$fn - $vehicleid msg apns '$alertmsg' => $pushkeyvalue";
+    AE::log debug => "#$fn - $vehicleid msg apns '$alertmsg' => $pushkeyvalue";
     &apns_send( $pushkeyvalue => { aps => { alert => "$vehicleid\n$alertmsg", sound => 'default' } } );
     }
   $apns_handle->on_drain(sub
@@ -1662,7 +1712,7 @@ sub apns_tim
       }
     else
       {
-      AE::log info => "- - - msg apns connected to $host, now establishing SSL security";
+      AE::log debug => "- - - msg apns connected to $host, now establishing SSL security";
       $apns_handle = new AnyEvent::Handle(
           fh       => $fh,
           peername => $host,
@@ -1721,7 +1771,7 @@ sub gcm_tim
     my $timestamp = $rec->{'timestamp'};
     my $pushkeyvalue = $rec->{'pushkeyvalue'};
     my $appid = $rec->{'appid'};
-    AE::log info => "#$fn - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
+    AE::log debug => "#$fn - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
     my $body = 'registration_id='.uri_escape($pushkeyvalue)
               .'&data.title='.uri_escape($vehicleid)
               .'&data.type='.uri_escape($alerttype)
@@ -1737,7 +1787,7 @@ sub gcm_tim
         {
         my ($data, $headers) = @_;
         foreach (split /\n/,$data)
-          { AE::log info => "- - - msg gcm message sent ($_)"; }
+          { AE::log debug => "- - - msg gcm message sent ($_)"; }
         };
     }
   @gcm_queue = ();
@@ -1754,7 +1804,7 @@ sub mail_tim
     my $pushkeyvalue = $rec->{'pushkeyvalue'};
     if ($pushkeyvalue =~ /@/)
       {
-      AE::log info => "#$fn - $vehicleid msg mail '$alertmsg' => '$pushkeyvalue'";
+      AE::log debug => "#$fn - $vehicleid msg mail '$alertmsg' => '$pushkeyvalue'";
       my $message = Email::MIME->create(
         header_str => [
           From    => $mail_sender,
@@ -1777,7 +1827,7 @@ sub http_request_in_root
   {
   my ($httpd, $req) = @_;
 
-  AE::log info => join(' ','http','-','-',$req->client_host.':'.$req->client_port,'-',$req->method,$req->url);
+  AE::log trace => join(' ','http','-','-',$req->client_host.':'.$req->client_port,'-',$req->method,$req->url);
 
   $req->respond ( [404, 'not found', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "not found\n"] );
   $httpd->stop_request;
@@ -2526,7 +2576,7 @@ sub http_request_in_api
     my $fnc = $http_request_api_noauth{uc($method) . ':' . $fn};
     if (defined $fnc)
       {
-      AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
+      AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
       &$fnc($httpd, $req, undef, @paths);
       return;
       }
@@ -2536,7 +2586,7 @@ sub http_request_in_api
       my $fnc = $http_request_api_auth{uc($method) . ':' . $fn};
       if (defined $fnc)
         {
-        AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
+        AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
         &$fnc($httpd, $req, $session, @paths);
         return;
         }
@@ -2582,7 +2632,7 @@ sub http_request_in_mqapi_auth
       my $passwordhash = $row->{'pass'};
       if (&drupal_password_check($passwordhash, $p_password))
         {
-        AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'mqapi/auth',$p_username,'SUCCESS');
+        AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'mqapi/auth',$p_username,'SUCCESS');
         $req->respond ( [200, 'Authentication OK', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, ''] );
         $httpd->stop_request;
         return;
