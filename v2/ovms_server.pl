@@ -38,7 +38,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.7.0-20230110";
+my $VERSION = "2.8.0-20230114";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -2501,6 +2501,9 @@ sub http_request_api_historical
 
   my ($vehicleid,$datatype) = @rest;
 
+  my $since = $req->url->query_param('since');
+  $since = '0000-00-00' if (!defined $since);
+
   if ((!defined $vehicleid)||(!defined $api_conns{$session}{'vehicles'}{$vehicleid}))
     {
     AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'Forbidden access',$vehicleid);
@@ -2514,8 +2517,8 @@ sub http_request_api_historical
     {
     # A Request for the historical data summary
     my $sth = $db->prepare('SELECT h_recordtype,COUNT(DISTINCT h_recordnumber) AS distinctrecs, COUNT(*) AS totalrecs,SUM(LENGTH(h_recordtype)+LENGTH(h_data)+LENGTH(vehicleid)+20) AS totalsize, MIN(h_timestamp) AS first, MAX(h_timestamp) AS last '
-                         . 'FROM ovms_historicalmessages WHERE vehicleid=? GROUP BY h_recordtype ORDER BY h_recordtype;');
-    $sth->execute($vehicleid);
+                         . 'FROM ovms_historicalmessages WHERE vehicleid=? AND h_timestamp>? GROUP BY h_recordtype ORDER BY h_recordtype;');
+    $sth->execute($vehicleid,$since);
     my $rows = $sth->rows;
     while (my $row = $sth->fetchrow_hashref())
       {
@@ -2530,8 +2533,8 @@ sub http_request_api_historical
   else
     {
     # A request for a specific type of historical data
-    my $sth = $db->prepare('SELECT * FROM ovms_historicalmessages WHERE vehicleid=? AND h_recordtype=? ORDER BY h_timestamp,h_recordnumber');
-    $sth->execute($vehicleid,$datatype);
+    my $sth = $db->prepare('SELECT * FROM ovms_historicalmessages WHERE vehicleid=? AND h_recordtype=? AND h_timestamp>? ORDER BY h_timestamp,h_recordnumber');
+    $sth->execute($vehicleid,$datatype,$since);
     while (my $row = $sth->fetchrow_hashref())
       {
       my %h;
