@@ -38,7 +38,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.8.0-20230114";
+my $VERSION = "2.9.1-20230617";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -1834,53 +1834,79 @@ sub http_request_in_root
   }
 
 
-# GET     /api/cookie                             Login and return a session cookie
-INIT { $http_request_api_noauth{'GET:cookie'} = \&http_request_api_cookie_login; }
-sub http_request_api_cookie_login
-  {
-  my ($httpd,$req,$session,@rest) = @_;
+# ------------------------------------------------------------------------------
+# Cookie auth
+# ------------------------------------------------------------------------------
 
-  my $username = $req->url->query_param('username');
-  my $password = $req->url->query_param('password');
+# create / update session:
+sub api_get_session
+  {
+  my ($req, $username, $password, $explicit) = @_;
 
   if ((defined $username)&&(defined $password))
     {
+    # Check username:
     my $sth = $db->prepare('SELECT * FROM ovms_owners WHERE `name`=? and `status`=1 AND deleted="0000-00-00 00:00:00"');
     $sth->execute($username);
-    my $row = $sth->fetchrow_hashref();
-    if (defined $row)
+    my $owner = $sth->fetchrow_hashref();
+
+    if (defined $owner)
       {
-      my $passwordhash = $row->{'pass'};
+      my $sessionid;
+      # Check if password is the main user password:
+      my $passwordhash = $owner->{'pass'};
       my $encoded = eval $pw_encode;
       if ($encoded eq $passwordhash)
         {
-        # Password ok
-        my $ug = new Data::UUID;
-        my $sessionid =  $ug->create_str();
-
+        if ($explicit eq true)
+          {
+          # create random sessionid:
+          my $ug = new Data::UUID;
+          $sessionid = 'C01-' . $username . '-' . $ug->create_str();
+          }
+        else
+          {
+          # create static sessionid:
+          $sessionid = 'P01-' . $username . '-' . $encoded;
+          }
+        }
+      else
+        {
+        # Check if password is a defined user token:
+        $sth = $db->prepare('SELECT * FROM ovms_apitokens WHERE owner=? AND token=?');
+        $sth->execute($owner->{'owner'}, $password);
+        my $token = $sth->fetchrow_hashref();
+        if (defined $token)
+          {
+          # create static sessionid:
+          $sessionid = 'T01-' . $username . '-' . $encoded;
+          }
+        }
+      
+      if (defined $sessionid)
+        {
+        if (!defined $api_conns{$sessionid})
+          {
+          AE::log info => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'session created');
+          }
         $api_conns{$sessionid}{'username'} = $username;
-        $api_conns{$sessionid}{'owner'} = $row->{'owner'};
-        $api_conns{$sessionid}{'mail'} = $row->{'name'};
+        $api_conns{$sessionid}{'owner'} = $owner->{'owner'};
+        $api_conns{$sessionid}{'mail'} = $owner->{'name'};
         $api_conns{$sessionid}{'sessionused'} = AnyEvent->now;
 
         $sth = $db->prepare('SELECT * FROM ovms_cars WHERE owner=? AND deleted=0');
-        $sth->execute($row->{'owner'});
-        while (my $row = $sth->fetchrow_hashref())
+        $sth->execute($owner->{'owner'});
+        while (my $car = $sth->fetchrow_hashref())
           {
-          $api_conns{$sessionid}{'vehicles'}{$row->{'vehicleid'}} = 0;
+          $api_conns{$sessionid}{'vehicles'}{$car->{'vehicleid'}} = 0;
           }
 
-        AE::log info => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'session created');
-
-        $req->respond (  [200, 'Authentication ok', { 'Content-Type' => 'text/plain', 'Set-Cookie' => "ovmsapisession=$sessionid", 'Access-Control-Allow-Origin' => '*' }, "Login ok\n"] );
-        $httpd->stop_request;
-        return;
+        return $sessionid;
         }
       }
     }
 
-  $req->respond ( [404, 'Authentication failed', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
-  $httpd->stop_request;
+  return undef;
   }
 
 # Delete an API session
@@ -1902,12 +1928,36 @@ sub api_delete_session
   delete $api_conns{$session};
   }
 
+
+# GET     /api/cookie                             Login and return a session cookie
+INIT { $http_request_api_noauth{'GET:cookie'} = \&http_request_api_cookie_login; }
+sub http_request_api_cookie_login
+  {
+  my ($httpd,$req,$session,@rest) = @_;
+
+  my $username = $req->url->query_param('username');
+  my $password = $req->url->query_param('password');
+
+  my $sessionid = api_get_session($req, $username, $password, true);
+
+  if (defined $sessionid)
+    {
+    $req->respond (  [200, 'Authentication ok', { 'Content-Type' => 'text/plain', 'Set-Cookie' => "ovmsapisession=$sessionid", 'Access-Control-Allow-Origin' => '*' }, "Login ok\n"] );
+    $httpd->stop_request;
+    return;
+    }
+
+  $req->respond ( [404, 'Authentication failed', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
+  $httpd->stop_request;
+  }
+
 # DELETE  /api/cookie                             Delete the session cookie and logout
 INIT { $http_request_api_auth{'DELETE:cookie'} = \&http_request_api_cookie_logout; }
 sub http_request_api_cookie_logout
   {
   my ($httpd,$req,$session,@rest) = @_;
 
+  my $username = $api_conns{$session}{'username'};
   api_delete_session($session);
 
   AE::log info => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'session destroyed (on request)');
@@ -1915,6 +1965,177 @@ sub http_request_api_cookie_logout
   $req->respond ( [200, 'Logout ok', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Logout ok\n"] );
   $httpd->stop_request;
   }
+
+
+# ------------------------------------------------------------------------------
+# Token auth
+# ------------------------------------------------------------------------------
+
+my %cache_owneridbyname = ();
+sub DBOwnerIDByName
+  {
+  my ($name) = @_;
+
+  return $cache_owneridbyname{$name} if (defined $cache_owneridbyname{$name});
+
+  my $sth = $db->prepare('SELECT * FROM ovms_owners WHERE `name`=? and `status`=1 AND deleted="0000-00-00 00:00:00"');
+  $sth->execute($name);
+  my $row = $sth->fetchrow_hashref();
+
+  if (defined $row)
+    {
+    $cache_owneridbyname{$name} = $row->{'owner'};
+    return $row->{'owner'};
+    }
+  else
+    {
+    return undef;
+    }
+  }
+
+sub DbGetToken
+  {
+  my ($ownername, $token) = @_;
+
+  my $sth = $db->prepare('SELECT * FROM ovms_apitokens WHERE owner=? AND token=?');
+  $sth->execute(DBOwnerIDByName($ownername), $token);
+  my $row = $sth->fetchrow_hashref();
+
+  return $row;
+  }
+
+sub DbGetOwnerTokens
+  {
+  my ($ownername) = @_;
+
+  my $sth = $db->prepare('SELECT * FROM ovms_apitokens WHERE owner=?');
+  $sth->execute(DBOwnerIDByName($ownername));
+  my @rows;
+  while (my $row = $sth->fetchrow_hashref())
+    {
+    $row->{'owner'} = $ownername;
+    push @rows,$row;
+    }
+
+  return @rows;
+  }
+
+sub DbSaveToken
+  {
+  my ($ownername, $token, $application, $purpose, $permit) = @_;
+
+  $application = 'not specified' if (!defined $application);
+  $purpose = 'not specified' if (!defined $purpose);
+  $permit = 'none' if (!defined $permit);
+
+  $db->do("INSERT INTO ovms_apitokens (owner,token,application,purpose,permit,created,refreshed,lastused) "
+        . "VALUES (?,?,?,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP(),UTC_TIMESTAMP()) "
+        . "ON DUPLICATE KEY UPDATE "
+        . "application=?, purpose=?, permit=?",
+          undef,
+          DBOwnerIDByName($ownername), $token, $application, $purpose, $permit,
+          $application, $purpose, $permit);
+  }
+
+sub DbDeleteToken
+  {
+  my ($ownername, $token) = @_;
+
+  $db->do("DELETE FROM ovms_apitokens WHERE owner=? AND token=?",
+          undef,
+          DBOwnerIDByName($ownername), $token);
+  }
+
+
+# GET     /api/token                              Return a list of API tokens
+INIT { $http_request_api_auth{'GET:token'} =      \&http_request_api_token_list; }
+sub http_request_api_token_list
+  {
+  my ($httpd, $req, $session, @rest) = @_;
+  my $username = $api_conns{$session}{'username'};
+
+  my @result;
+  foreach my $row (DbGetOwnerTokens($username))
+    {
+    push @result, $row;
+    }
+
+  my $json = JSON::XS->new->utf8->canonical->encode (\@result) . "\n";
+  $req->respond ( [200, 'Ok', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
+  $httpd->stop_request;
+  }
+
+# POST    /api/token                              Obtain an API token
+INIT { $http_request_api_auth{'POST:token'} =     \&http_request_api_token_obtain; }
+sub http_request_api_token_obtain
+  {
+  my ($httpd, $req, $session, @rest) = @_;
+  my $username = $api_conns{$session}{'username'};
+
+  my $application = $req->parm('application'); $application='notspecified' if (!defined $application);
+  my $purpose = $req->parm('purpose'); $purpose='notspecified' if (!defined $purpose);
+  my $permit = $req->parm('permit'); $permit='auth' if (!defined $permit);
+
+  my $random;
+  if (open my $r, '<', '/dev/urandom')
+    {
+    read $r,$random,512;
+    close $r;
+    }
+  while (length($random) < 512)
+    {
+    $random .= rand(255);
+    }
+  my $token = Digest::SHA::sha256_hex($random);
+
+  DbSaveToken($username, $token, $application, $purpose, $permit);
+
+  my %result = ( owner => $username,
+                 token => $token,
+                 application => $application,
+                 purpose => $purpose,
+                 permit => $permit
+                 );
+
+  my $json = JSON::XS->new->utf8->canonical->encode (\%result) . "\n";
+  $req->respond ( [201, 'Created', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
+
+  $httpd->stop_request;
+  return;
+  }
+
+# DELETE  /api/token                              Delete the specified api token
+INIT { $http_request_api_auth{'DELETE:token'} =  \&http_request_api_token_delete; }
+sub http_request_api_token_delete
+  {
+  my ($httpd, $req, $session, @rest) = @_;
+  my $username = $api_conns{$session}{'username'};
+
+  my ($token) = @rest;
+
+  if (defined $token)
+    {
+    DbDeleteToken($username, $token);
+
+    my %result = ( owner => $username,
+                   token => $token);
+
+    my $json = JSON::XS->new->utf8->canonical->encode (\%result) . "\n";
+    $req->respond ( [200, 'Ok', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
+
+    $httpd->stop_request;
+    return;
+    }
+  else
+    {
+    $req->respond ( [404, 'Token missing', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Token not specified\n"] );
+    $httpd->stop_request;
+    return;
+    }
+  }
+
+
+# ------------------------------------------------------------------------------
 
 # GET     .api/vehicles                           Return alist of registered vehicles
 INIT { $http_request_api_auth{'GET:vehicles'} = \&http_request_api_vehicles; }
@@ -1935,7 +2156,7 @@ sub http_request_api_vehicles
     }
 
   my $json = JSON::XS->new->utf8->canonical->encode (\@result) . "\n";
-  $req->respond ( [200, 'Logout ok', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
+  $req->respond ( [200, 'OK', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
   $httpd->stop_request;
   }
 
@@ -1970,7 +2191,7 @@ sub http_request_api_protocol
     }
 
   my $json = JSON::XS->new->utf8->canonical->encode (\@result) . "\n";
-  $req->respond ( [200, 'Logout ok', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
+  $req->respond ( [200, 'OK', { 'Content-Type' => 'application/json', 'Access-Control-Allow-Origin' => '*' }, $json] );
   $httpd->stop_request;
   }
 
@@ -2560,6 +2781,8 @@ sub http_request_in_api
   my @paths = $req->url->path_segments;
   my $headers = $req->headers;
 
+  my $username;
+  my $password;
   my $cookie = $headers->{'cookie'};
   my $session = '-';
   COOKIEJAR: foreach (split /;\s+/,$cookie)
@@ -2576,6 +2799,8 @@ sub http_request_in_api
     shift @paths; # Skip '' root
     shift @paths; # Skip 'api'
     my $fn = shift @paths;
+
+    # check API method map: no auth required? (only /api/cookie)
     my $fnc = $http_request_api_noauth{uc($method) . ':' . $fn};
     if (defined $fnc)
       {
@@ -2583,7 +2808,21 @@ sub http_request_in_api
       &$fnc($httpd, $req, undef, @paths);
       return;
       }
-    if ((defined $session)&&($session ne '-')&&(defined $api_conns{$session}))
+
+    # create/get API session:
+    if (!(defined $session) || ($session eq '-') || !(defined $api_conns{$session}))
+      {
+      $username = $req->url->query_param('username');
+      $password = $req->url->query_param('password');
+      if (defined $username && defined $password)
+        {
+        $session = api_get_session($req, $username, $password, false);
+        $session = '-' if (!defined $session);
+        }
+      }
+    
+    # do we have a valid API session?
+    if ((defined $session) && ($session ne '-') && (defined $api_conns{$session}))
       {
       $api_conns{$session}{'sessionused'} = AnyEvent->now;
       my $fnc = $http_request_api_auth{uc($method) . ':' . $fn};
