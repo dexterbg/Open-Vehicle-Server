@@ -38,7 +38,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.9.1-20230617";
+my $VERSION = "2.9.1-20230620";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -1842,6 +1842,7 @@ sub http_request_in_root
 sub api_get_session
   {
   my ($req, $username, $password, $explicit) = @_;
+  my $permit = '';
 
   if ((defined $username)&&(defined $password))
     {
@@ -1858,6 +1859,7 @@ sub api_get_session
       my $encoded = eval $pw_encode;
       if ($encoded eq $passwordhash)
         {
+        $permit = 'auth,session,admin';
         if ($explicit eq true)
           {
           # create random sessionid:
@@ -1880,6 +1882,7 @@ sub api_get_session
           {
           # create static sessionid:
           $sessionid = 'T01-' . $username . '-' . $encoded;
+          $permit = $token->{'permit'};
           }
         }
       
@@ -1890,6 +1893,7 @@ sub api_get_session
           AE::log info => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'session created');
           }
         $api_conns{$sessionid}{'username'} = $username;
+        $api_conns{$sessionid}{'permit'} = $permit;
         $api_conns{$sessionid}{'owner'} = $owner->{'owner'};
         $api_conns{$sessionid}{'mail'} = $owner->{'name'};
         $api_conns{$sessionid}{'sessionused'} = AnyEvent->now;
@@ -2046,6 +2050,21 @@ sub DbDeleteToken
           DBOwnerIDByName($ownername), $token);
   }
 
+sub IsPermitted
+  {
+  my ($permissions, @rights) = @_;
+
+  return 1 if ($permissions eq '*');
+
+  my %ph = map { lc($_) => 1 } split(/\s*,\s*/,$permissions);
+
+  foreach my $right (@rights)
+    {
+    return 1 if (defined $ph{lc($right)});
+    }
+
+  return 0;
+  }
 
 # GET     /api/token                              Return a list of API tokens
 INIT { $http_request_api_auth{'GET:token'} =      \&http_request_api_token_list; }
