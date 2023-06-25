@@ -2735,6 +2735,7 @@ sub http_request_api_homelink
 # GET	/api/historical/<VEHICLEID>		Request historical data summary
 # GET     /api/historical/<VEHICLEID>/<DATATYPE>  Request historical data records
 INIT { $http_request_api_auth{'GET:historical'} = \&http_request_api_historical; }
+BEGIN { $http_request_api_call{'GET:historical'} = [ \&http_request_api_historical ]; }
 sub http_request_api_historical
   {
   my ($httpd,$req,$session,@rest) = @_;
@@ -2791,6 +2792,10 @@ sub http_request_api_historical
   $httpd->stop_request;
   }
 
+
+########################################################
+# API function dispatcher
+
 sub http_request_in_api
   {
   my ($httpd, $req) = @_;
@@ -2800,8 +2805,6 @@ sub http_request_in_api
   my @paths = $req->url->path_segments;
   my $headers = $req->headers;
 
-  my $username;
-  my $password;
   my $cookie = $headers->{'cookie'};
   my $session = '-';
   COOKIEJAR: foreach (split /;\s+/,$cookie)
@@ -2819,52 +2822,63 @@ sub http_request_in_api
     shift @paths; # Skip 'api'
     my $fn = shift @paths;
 
-    # check API method map: no auth required? (only /api/cookie)
-    my $fnc = $http_request_api_noauth{uc($method) . ':' . $fn};
-    if (defined $fnc)
+    my $apicall = $http_request_api_call{uc($method) . ':' . $fn};
+    if (defined $apicall)
       {
-      AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
-      &$fnc($httpd, $req, undef, @paths);
-      return;
-      }
+      my ($fnc,@rights) = @{$apicall};
 
-    # create/get API session:
-    if (!(defined $session) || ($session eq '-') || !(defined $api_conns{$session}))
-      {
-      $username = $req->url->query_param('username');
-      $password = $req->url->query_param('password');
-      if (defined $username && defined $password)
+      AE::log debug => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
+
+      # Try to authenticate (by cookie, or username)...
+      my $username;
+      my $permissions = 'none';
+      if ((defined $sessionid)&&($sessionid ne '-')&&(defined $api_conns{$sessionid}))
         {
-        $session = api_get_session($req, $username, $password, false);
-        $session = '-' if (!defined $session);
+        # We have an existing session that we can use
+        $username =    $api_conns{$sessionid}{'owner'};
+        $permissions = $api_conns{$sessionid}{'permissions'};
         }
-      }
-    
-    # do we have a valid API session?
-    if ((defined $session) && ($session ne '-') && (defined $api_conns{$session}))
-      {
-      $api_conns{$session}{'sessionused'} = AnyEvent->now;
-      my $fnc = $http_request_api_auth{uc($method) . ':' . $fn};
-      if (defined $fnc)
+      else
         {
-        AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
-        &$fnc($httpd, $req, $session, @paths);
+        my $u = $req->url->query_param('username');
+        my $p = $req->url->query_param('password');
+        if ((defined $u)&&(defined $p))
+          {
+          $permissions = Authenticate($u,$p);
+          $username = $u if ($permissions ne '');
+          }
+        }
+
+      if ((defined $username)&&($permissions ne 'none'))
+        {
+        if ((scalar @rights == 0) || (IsPermitted($permissions,@rights)))
+          {
+          &$fnc($httpd, $req, $sessionid, $username, $permissions, @paths);
+          return;
+          }
+        else
+          {
+          AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'insuffrights',$req->method,join('/',$req->url->path_segments));
+          $req->respond ( [403, 'Forbidden', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Insufficient rights\n"] );
+          $httpd->stop_request;
+          return;
+          }
+        }
+      else
+        {
+        AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'authfail',$req->method,join('/',$req->url->path_segments));
+        $req->respond ( [401, 'Unauthorized', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
+        $httpd->stop_request;
         return;
         }
       }
-    else
-      {
-      AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'authfail',$req->method,join('/',$req->url->path_segments));
-      $req->respond ( [404, 'Authentication failed', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
-      $httpd->stop_request;
-      return;
-      }
     }
 
-  AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'noapi',$req->method,join('/',$req->url->path_segments));
+  AE::log error => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'noapi',$req->method,join('/',$req->url->path_segments));
   $req->respond ( [404, 'Unrecongised API call', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Unrecognised API call\n"] );
   $httpd->stop_request;
   }
+
 
 sub http_request_in_mqapi_auth
   {
