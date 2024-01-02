@@ -30,6 +30,7 @@ use Email::MIME;
 use Email::Sender::Simple qw(sendmail);
 use POSIX qw(strftime);
 use Time::Piece;
+use List::Util qw( min max );
 
 use constant SOL_TCP => 6;
 use constant TCP_KEEPIDLE => 4;
@@ -38,7 +39,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.9.1-20230620";
+my $VERSION = "2.9.2-20230918";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -992,10 +993,11 @@ sub io_message
         AE::log debug => "#$fn $clienttype $vehicleid msg push subscription $vk_vehicleid:$pushtype/$pushkeytype => $vk_pushkeyvalue";
         $db->do("INSERT INTO ovms_notifies (vehicleid,appid,pushtype,pushkeytype,pushkeyvalue,lastupdated) "
               . "VALUES (?,?,?,?,?,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE "
-              . "lastupdated=UTC_TIMESTAMP(), pushkeytype=?, pushkeyvalue=?",
+              . "lastupdated=UTC_TIMESTAMP(), pushtype=?, pushkeytype=?, pushkeyvalue=?",
                 undef,
-                $vk_vehicleid, $appid, $pushtype, $pushkeytype, $vk_pushkeyvalue,
-                $pushkeytype,$vk_pushkeyvalue);
+                $vk_vehicleid, $appid,
+                $pushtype, $pushkeytype, $vk_pushkeyvalue,
+                $pushtype, $pushkeytype, $vk_pushkeyvalue);
         }
       }
     return;
@@ -2050,21 +2052,6 @@ sub DbDeleteToken
           DBOwnerIDByName($ownername), $token);
   }
 
-sub IsPermitted
-  {
-  my ($permissions, @rights) = @_;
-
-  return 1 if ($permissions eq '*');
-
-  my %ph = map { lc($_) => 1 } split(/\s*,\s*/,$permissions);
-
-  foreach my $right (@rights)
-    {
-    return 1 if (defined $ph{lc($right)});
-    }
-
-  return 0;
-  }
 
 # GET     /api/token                              Return a list of API tokens
 INIT { $http_request_api_auth{'GET:token'} =      \&http_request_api_token_list; }
@@ -2402,8 +2389,11 @@ sub http_request_api_tpms
     return;
     }
 
-  my $rec = &api_vehiclerecord($vehicleid,'W');
   my %result;
+  my $rec;
+
+  # try new extended TPMS 'Y' record first:
+  $rec = &api_vehiclerecord($vehicleid,'Y');
   if (defined $rec)
     {
     if ($rec->{'m_paranoid'})
@@ -2412,19 +2402,70 @@ sub http_request_api_tpms
       $httpd->stop_request;
       return;
       }
-    my ($fr_pressure,$fr_temp,$rr_pressure,$rr_temp,$fl_pressure,$fl_temp,$rl_pressure,$rl_temp,$staletpms) = split /,/,$rec->{'m_msg'};
+    
     my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+    $result{'m_msgtime_y'} = $rec->{'m_msgtime'};
+    $result{'m_msgage_y'} = time() - $t->epoch;
+    
+    my @tdata = split /,/,$rec->{'m_msg'};
+    
+    # record structure: https://docs.openvehicles.com/en/latest/protocol_v2/messages.html#car-tpms-message-0x59-y
+    my @t_name = splice(@tdata, 0, $tdata[0]+1);
+    my @t_press = splice(@tdata, 0, $tdata[0]+1);
+    my $stale_press = shift(@tdata);
+    my @t_temp = splice(@tdata, 0, $tdata[0]+1);
+    my $stale_temp = shift(@tdata);
+    my @t_health = splice(@tdata, 0, $tdata[0]+1);
+    my $stale_health = shift(@tdata);
+    my @t_alert = splice(@tdata, 0, $tdata[0]+1);
+    my $stale_alert = shift(@tdata);
+    
+    for (my $i = 1; $i <= $t_name[0]; $i++)
+      {
+      my $tn = lc($t_name[$i]);
+      if ($i <= $t_press[0])  { $result{$tn.'_pressure_kpa'} = $t_press[$i]; }
+      if ($i <= $t_press[0])  { $result{$tn.'_pressure'}     = $t_press[$i] * 0.14503773773020923; }
+      if ($i <= $t_temp[0])   { $result{$tn.'_temperature'}  = $t_temp[$i]; }
+      if ($i <= $t_health[0]) { $result{$tn.'_health'}       = $t_health[$i]; }
+      if ($i <= $t_alert[0])  { $result{$tn.'_alert'}        = $t_alert[$i]; }
+      }
+    
+    $result{'stale_pressure'} = $stale_press;
+    $result{'stale_temperature'} = $stale_temp;
+    $result{'stale_health'} = $stale_health;
+    $result{'stale_alert'} = $stale_alert;
+    
+    # backwards compatibility:
     $result{'m_msgtime_w'} = $rec->{'m_msgtime'};
     $result{'m_msgage_w'} = time() - $t->epoch;
-    $result{'fr_pressure'} = $fr_pressure;
-    $result{'fr_temperature'} = $fr_temp;
-    $result{'rr_pressure'} = $rr_pressure;
-    $result{'rr_temperature'} = $rr_temperature;
-    $result{'fl_pressure'} = $fl_pressure;
-    $result{'fl_temperature'} = $fl_temperature;
-    $result{'rl_pressure'} = $rl_pressure;
-    $result{'rl_temperature'} = $rl_temperature;
-    $result{'staletpms'} = $staletpms;
+    $result{'staletpms'} = max($stale_press, $stale_temp, $stale_health, $stale_alert);
+    }
+  else
+    {
+    # no 'Y' record found, fallback to legacy TPMS 'W' record:
+    $rec = &api_vehiclerecord($vehicleid,'W');
+    if (defined $rec)
+      {
+      if ($rec->{'m_paranoid'})
+        {
+        $req->respond ( [404, 'Vehicle is paranoid', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Paranoid vehicles not supported by api\n"] );
+        $httpd->stop_request;
+        return;
+        }
+      my ($fr_pressure,$fr_temp,$rr_pressure,$rr_temp,$fl_pressure,$fl_temp,$rl_pressure,$rl_temp,$staletpms) = split /,/,$rec->{'m_msg'};
+      my $t = Time::Piece->strptime($rec->{'m_msgtime'}, "%Y-%m-%d %H:%M:%S");
+      $result{'m_msgtime_w'} = $rec->{'m_msgtime'};
+      $result{'m_msgage_w'} = time() - $t->epoch;
+      $result{'fr_pressure'} = $fr_pressure;
+      $result{'fr_temperature'} = $fr_temp;
+      $result{'rr_pressure'} = $rr_pressure;
+      $result{'rr_temperature'} = $rr_temperature;
+      $result{'fl_pressure'} = $fl_pressure;
+      $result{'fl_temperature'} = $fl_temperature;
+      $result{'rl_pressure'} = $rl_pressure;
+      $result{'rl_temperature'} = $rl_temperature;
+      $result{'staletpms'} = $staletpms;
+      }
     }
 
   my $json = JSON::XS->new->utf8->canonical->encode (\%result) . "\n";
@@ -2735,7 +2776,6 @@ sub http_request_api_homelink
 # GET	/api/historical/<VEHICLEID>		Request historical data summary
 # GET     /api/historical/<VEHICLEID>/<DATATYPE>  Request historical data records
 INIT { $http_request_api_auth{'GET:historical'} = \&http_request_api_historical; }
-BEGIN { $http_request_api_call{'GET:historical'} = [ \&http_request_api_historical ]; }
 sub http_request_api_historical
   {
   my ($httpd,$req,$session,@rest) = @_;
@@ -2792,10 +2832,6 @@ sub http_request_api_historical
   $httpd->stop_request;
   }
 
-
-########################################################
-# API function dispatcher
-
 sub http_request_in_api
   {
   my ($httpd, $req) = @_;
@@ -2805,6 +2841,8 @@ sub http_request_in_api
   my @paths = $req->url->path_segments;
   my $headers = $req->headers;
 
+  my $username;
+  my $password;
   my $cookie = $headers->{'cookie'};
   my $session = '-';
   COOKIEJAR: foreach (split /;\s+/,$cookie)
@@ -2822,63 +2860,52 @@ sub http_request_in_api
     shift @paths; # Skip 'api'
     my $fn = shift @paths;
 
-    my $apicall = $http_request_api_call{uc($method) . ':' . $fn};
-    if (defined $apicall)
+    # check API method map: no auth required? (only /api/cookie)
+    my $fnc = $http_request_api_noauth{uc($method) . ':' . $fn};
+    if (defined $fnc)
       {
-      my ($fnc,@rights) = @{$apicall};
+      AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
+      &$fnc($httpd, $req, undef, @paths);
+      return;
+      }
 
-      AE::log debug => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
-
-      # Try to authenticate (by cookie, or username)...
-      my $username;
-      my $permissions = 'none';
-      if ((defined $sessionid)&&($sessionid ne '-')&&(defined $api_conns{$sessionid}))
+    # create/get API session:
+    if (!(defined $session) || ($session eq '-') || !(defined $api_conns{$session}))
+      {
+      $username = $req->url->query_param('username');
+      $password = $req->url->query_param('password');
+      if (defined $username && defined $password)
         {
-        # We have an existing session that we can use
-        $username =    $api_conns{$sessionid}{'owner'};
-        $permissions = $api_conns{$sessionid}{'permissions'};
+        $session = api_get_session($req, $username, $password, false);
+        $session = '-' if (!defined $session);
         }
-      else
+      }
+    
+    # do we have a valid API session?
+    if ((defined $session) && ($session ne '-') && (defined $api_conns{$session}))
+      {
+      $api_conns{$session}{'sessionused'} = AnyEvent->now;
+      my $fnc = $http_request_api_auth{uc($method) . ':' . $fn};
+      if (defined $fnc)
         {
-        my $u = $req->url->query_param('username');
-        my $p = $req->url->query_param('password');
-        if ((defined $u)&&(defined $p))
-          {
-          $permissions = Authenticate($u,$p);
-          $username = $u if ($permissions ne '');
-          }
-        }
-
-      if ((defined $username)&&($permissions ne 'none'))
-        {
-        if ((scalar @rights == 0) || (IsPermitted($permissions,@rights)))
-          {
-          &$fnc($httpd, $req, $sessionid, $username, $permissions, @paths);
-          return;
-          }
-        else
-          {
-          AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'insuffrights',$req->method,join('/',$req->url->path_segments));
-          $req->respond ( [403, 'Forbidden', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Insufficient rights\n"] );
-          $httpd->stop_request;
-          return;
-          }
-        }
-      else
-        {
-        AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'authfail',$req->method,join('/',$req->url->path_segments));
-        $req->respond ( [401, 'Unauthorized', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
-        $httpd->stop_request;
+        AE::log debug => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'ok',$req->method,join('/',$req->url->path_segments));
+        &$fnc($httpd, $req, $session, @paths);
         return;
         }
       }
+    else
+      {
+      AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'authfail',$req->method,join('/',$req->url->path_segments));
+      $req->respond ( [404, 'Authentication failed', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Authentication failed\n"] );
+      $httpd->stop_request;
+      return;
+      }
     }
 
-  AE::log error => join(' ','http','-',$sessionid,$req->client_host.':'.$req->client_port,'noapi',$req->method,join('/',$req->url->path_segments));
+  AE::log error => join(' ','http','-',$session,$req->client_host.':'.$req->client_port,'noapi',$req->method,join('/',$req->url->path_segments));
   $req->respond ( [404, 'Unrecongised API call', { 'Content-Type' => 'text/plain', 'Access-Control-Allow-Origin' => '*' }, "Unrecognised API call\n"] );
   $httpd->stop_request;
   }
-
 
 sub http_request_in_mqapi_auth
   {
