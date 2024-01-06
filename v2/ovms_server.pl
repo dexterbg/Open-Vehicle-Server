@@ -31,6 +31,8 @@ use Email::Sender::Simple qw(sendmail);
 use POSIX qw(strftime);
 use Time::Piece;
 use List::Util qw( min max );
+use WWW::FCM::HTTP::V1;
+use Try::Tiny;
 
 use constant SOL_TCP => 6;
 use constant TCP_KEEPIDLE => 4;
@@ -39,7 +41,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.9.2-20230918";
+my $VERSION = "2.10.1-20240102";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -123,8 +125,54 @@ my $dbtim = AnyEvent->timer (after => 60, interval => 60, cb => \&db_tim);
 # Apple push notifications ticker:
 my $apnstim = AnyEvent->timer (after => 1, interval => 1, cb => \&apns_tim);
 
+# Google push notifications connection:
+my $gcm_api_key_file = $config->val('gcm','api_key_file');
+my $gcm_project_id;
+my $gcm_api_key_json;
+my $gcm_api_url;
+my $gcm_con;
+
+if (!defined $gcm_api_key_file)
+  {
+  AE::log warn => "GCM API key file not configured => GCM disabled";
+  }
+else
+  {
+  if (open my $fh, '<', $gcm_api_key_file)
+    {
+    $gcm_api_key_json = do { local $/; <$fh> };
+    close $fh;
+    }
+  else
+    {
+    AE::log warn => "GCM API key file $gcm_api_key_file not found => GCM disabled";
+    }
+  }
+if (defined $gcm_api_key_json)
+  {
+  try
+    {
+    my $api_key = decode_json($gcm_api_key_json);
+    $gcm_project_id = $api_key->{'project_id'};
+    }
+  catch
+    {
+    AE::log warn => "GCM API key file $gcm_api_key_file invalid => GCM disabled";
+    };
+  }
+if (defined $gcm_project_id)
+  {
+  $gcm_api_url = "https://fcm.googleapis.com/v1/projects/$gcm_project_id/messages:send";
+  $gcm_con = WWW::FCM::HTTP::V1->new(
+    {
+    api_url      => $gcm_api_url,
+    api_key_json => $gcm_api_key_json,
+    });
+  }
+
 # Google push notifications ticker:
-my $gcmtim = AnyEvent->timer (after => 1, interval => 1, cb => \&gcm_tim);
+my $gcm_interval = $config->val('gcm','interval',10);
+my $gcmtim = AnyEvent->timer (after => $gcm_interval, interval => $gcm_interval, cb => \&gcm_tim);
 
 # Mail push notifications ticker:
 my $mail_enabled = $config->val('mail','enabled',0);
@@ -1759,8 +1807,7 @@ sub gcm_tim
   return if ($gcm_running);
   return if (scalar @gcm_queue == 0);
 
-  my $apikey = $config->val('gcm','apikey');
-  return if ((!defined $apikey)||($apikey eq ''));
+  return if (!defined $gcm_con);
 
   AE::log info => "- - - msg gcm processing queue";
   $gcm_running = 1;
@@ -1773,25 +1820,49 @@ sub gcm_tim
     my $timestamp = $rec->{'timestamp'};
     my $pushkeyvalue = $rec->{'pushkeyvalue'};
     my $appid = $rec->{'appid'};
-    AE::log debug => "#$fn - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
-    my $body = 'registration_id='.uri_escape($pushkeyvalue)
-              .'&data.title='.uri_escape($vehicleid)
-              .'&data.type='.uri_escape($alerttype)
-              .'&data.message='.uri_escape($alertmsg)
-              .'&data.time='.uri_escape($timestamp)
-              .'&collapse_key='.time;
-    http_request
-      POST=>'https://fcm.googleapis.com/fcm/send',
-      body => $body,
-      headers=>{ 'Authorization' => 'key='.$apikey,
-                 "Content-Type" => "application/x-www-form-urlencoded" },
-      sub
+    AE::log debug => "- - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
+
+    my $res = $gcm_con->send(
+      {
+      message =>
         {
-        my ($data, $headers) = @_;
-        foreach (split /\n/,$data)
-          { AE::log debug => "- - - msg gcm message sent ($_)"; }
-        };
+        token          => $pushkeyvalue,
+        data =>
+          {
+          type         => $alerttype,
+          time         => $timestamp,
+          title        => $vehicleid,
+          message      => $alertmsg,
+          },
+        android =>
+          {
+          collapse_key => unpack("H*", sha256($alerttype . $timestamp . $vehicleid . $alertmsg)),
+          },
+        },
+      });
+
+    if ($res->is_success)
+      {
+      AE::log debug => "- - $vehicleid msg gcm message sent to $pushkeyvalue";
+      }
+    else
+      {
+      AE::log trace => "- - $vehicleid msg gcm failure response: " . $res->{'content'};
+      my $rescont = decode_json($res->{'content'});
+      my $errcode = $rescont->{'error'}{'code'};
+      my $errmsg = $rescont->{'error'}{'message'};
+      AE::log error => "- - $vehicleid msg gcm error $errcode on $pushkeyvalue: $errmsg";
+      # App instance unregistered from FCM?
+      # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+      if ($errcode == 404)
+        {
+        AE::log info => "- - $vehicleid msg gcm unregister $appid";
+        $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
+                undef, $vehicleid, $appid);
+        }
+      }
     }
+
   @gcm_queue = ();
   $gcm_running = 0;
   }
