@@ -41,7 +41,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.10.1-20240102";
+my $VERSION = "2.11.1-20240106";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -66,7 +66,7 @@ my @apns_queue;
 my $apns_handle;
 my $apns_running=0;
 my @gcm_queue;
-my $gcm_running=0;
+my $gcm_running;
 my @mail_queue;
 
 # Auto-flush
@@ -119,6 +119,7 @@ if (!defined $db)
   exit(1);
   }
 $db->{mysql_auto_reconnect} = 1;
+$db->{AutoInactiveDestroy} = 1;     # child processes shall not destroy the connection
 $db->do("SET NAMES utf8mb4");
 my $dbtim = AnyEvent->timer (after => 60, interval => 60, cb => \&db_tim);
 
@@ -967,12 +968,24 @@ sub db_tim
   if (!defined $db)
     {
     $db = DBI->connect($config->val('db','path'),$config->val('db','user'),$config->val('db','pass'));
+    if (defined $db)
+      {
+      $db->{mysql_auto_reconnect} = 1;
+      $db->{AutoInactiveDestroy} = 1;     # child processes shall not destroy the connection
+      $db->do("SET NAMES utf8mb4");
+      }
     return;
     }
   if (! $db->ping())
     {
     AE::log error => "Lost database connection - reconnecting...";
     $db = DBI->connect($config->val('db','path'),$config->val('db','user'),$config->val('db','pass'));
+    if (defined $db)
+      {
+      $db->{mysql_auto_reconnect} = 1;
+      $db->{AutoInactiveDestroy} = 1;     # child processes shall not destroy the connection
+      $db->do("SET NAMES utf8mb4");
+      }
     }
   if (defined $db)
     {
@@ -1804,67 +1817,88 @@ sub apns_tim
 
 sub gcm_tim
   {
-  return if ($gcm_running);
+  return if (!defined $gcm_con);
+  return if (defined $gcm_running);
   return if (scalar @gcm_queue == 0);
 
-  return if (!defined $gcm_con);
-
-  AE::log info => "- - - msg gcm processing queue";
-  $gcm_running = 1;
-
-  foreach my $rec (@gcm_queue)
+  # WWW::FCM::HTTP::V1->send() is synchronous, needs ~0.3 seconds per call.
+  # Fork child process for asynchronous push message delivery:
+  my $pid = fork;
+  if (!defined $pid)
     {
-    my $vehicleid = $rec->{'vehicleid'};
-    my $alerttype = $rec->{'alerttype'};
-    my $alertmsg = $rec->{'alertmsg'};
-    my $timestamp = $rec->{'timestamp'};
-    my $pushkeyvalue = $rec->{'pushkeyvalue'};
-    my $appid = $rec->{'appid'};
-    AE::log debug => "- - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
-
-    my $res = $gcm_con->send(
-      {
-      message =>
-        {
-        token          => $pushkeyvalue,
-        data =>
-          {
-          type         => $alerttype,
-          time         => $timestamp,
-          title        => $vehicleid,
-          message      => $alertmsg,
-          },
-        android =>
-          {
-          collapse_key => unpack("H*", sha256($alerttype . $timestamp . $vehicleid . $alertmsg)),
-          },
-        },
-      });
-
-    if ($res->is_success)
-      {
-      AE::log debug => "- - $vehicleid msg gcm message sent to $pushkeyvalue";
-      }
-    else
-      {
-      AE::log trace => "- - $vehicleid msg gcm failure response: " . $res->{'content'};
-      my $rescont = decode_json($res->{'content'});
-      my $errcode = $rescont->{'error'}{'code'};
-      my $errmsg = $rescont->{'error'}{'message'};
-      AE::log error => "- - $vehicleid msg gcm error $errcode on $pushkeyvalue: $errmsg";
-      # App instance unregistered from FCM?
-      # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
-      if ($errcode == 404)
-        {
-        AE::log info => "- - $vehicleid msg gcm unregister $appid";
-        $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
-                undef, $vehicleid, $appid);
-        }
-      }
+    AE::log error => "- - - msg gcm processing: fatal: cannot create child process";
+    return;
     }
 
-  @gcm_queue = ();
-  $gcm_running = 0;
+  if ($pid == 0)
+    {
+    # we're the child process
+    AE::log info => "- - - msg gcm processing queue";
+
+    foreach my $rec (@gcm_queue)
+      {
+      my $vehicleid = $rec->{'vehicleid'};
+      my $alerttype = $rec->{'alerttype'};
+      my $alertmsg = $rec->{'alertmsg'};
+      my $timestamp = $rec->{'timestamp'};
+      my $pushkeyvalue = $rec->{'pushkeyvalue'};
+      my $appid = $rec->{'appid'};
+      AE::log debug => "- - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
+
+      my $res = $gcm_con->send(
+        {
+        message =>
+          {
+          token          => $pushkeyvalue,
+          data =>
+            {
+            type         => $alerttype,
+            time         => $timestamp,
+            title        => $vehicleid,
+            message      => $alertmsg,
+            },
+          android =>
+            {
+            collapse_key => unpack("H*", sha256($alerttype . $timestamp . $vehicleid . $alertmsg)),
+            },
+          },
+        });
+
+      if ($res->is_success)
+        {
+        AE::log debug => "- - $vehicleid msg gcm message sent to $pushkeyvalue";
+        }
+      else
+        {
+        AE::log trace => "- - $vehicleid msg gcm failure response: " . $res->{'content'};
+        my $rescont = decode_json($res->{'content'});
+        my $errcode = $rescont->{'error'}{'code'};
+        my $errmsg = $rescont->{'error'}{'message'};
+        AE::log error => "- - $vehicleid msg gcm error $errcode on $pushkeyvalue: $errmsg";
+        # App instance unregistered from FCM?
+        # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+        if ($errcode == 404)
+          {
+          AE::log info => "- - $vehicleid msg gcm unregister $appid";
+          $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
+                  undef, $vehicleid, $appid);
+          }
+        }
+      }
+    # exit child process
+    exit 0;
+    }
+  else
+    {
+    # we're the main process
+    $gcm_running = AnyEvent->child (pid => $pid, cb => sub
+      {
+      AE::log info => "- - - msg gcm processing finished";
+      undef $gcm_running;
+      }
+    );
+    @gcm_queue = ();
+    }
   }
 
 sub mail_tim
