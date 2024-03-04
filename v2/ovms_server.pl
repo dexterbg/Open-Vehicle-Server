@@ -41,7 +41,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.11.1-20240106";
+my $VERSION = "2.11.2-20240304";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -1833,7 +1833,8 @@ sub gcm_tim
   if ($pid == 0)
     {
     # we're the child process
-    AE::log info => "- - - msg gcm processing queue";
+    my $ptag = "[pid=" . $$ . "]";
+    AE::log info => "- - - $ptag msg gcm processing queue: " . scalar @gcm_queue . " messages";
 
     foreach my $rec (@gcm_queue)
       {
@@ -1843,7 +1844,7 @@ sub gcm_tim
       my $timestamp = $rec->{'timestamp'};
       my $pushkeyvalue = $rec->{'pushkeyvalue'};
       my $appid = $rec->{'appid'};
-      AE::log debug => "- - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
+      AE::log debug => "- - $vehicleid $ptag msg gcm '$alertmsg' => $pushkeyvalue";
 
       my $res = $gcm_con->send(
         {
@@ -1866,23 +1867,30 @@ sub gcm_tim
 
       if ($res->is_success)
         {
-        AE::log debug => "- - $vehicleid msg gcm message sent to $pushkeyvalue";
+        AE::log debug => "- - $vehicleid $ptag msg gcm message sent to $pushkeyvalue";
         }
       else
         {
-        AE::log trace => "- - $vehicleid msg gcm failure response: " . $res->{'content'};
-        my $rescont = decode_json($res->{'content'});
-        my $errcode = $rescont->{'error'}{'code'};
-        my $errmsg = $rescont->{'error'}{'message'};
-        AE::log error => "- - $vehicleid msg gcm error $errcode on $pushkeyvalue: $errmsg";
-        # App instance unregistered from FCM?
-        # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
-        if ($errcode == 404)
+        AE::log debug => "- - $vehicleid $ptag msg gcm failure response: " . $res->{'content'};
+        try
           {
-          AE::log info => "- - $vehicleid msg gcm unregister $appid";
-          $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
-                  undef, $vehicleid, $appid);
+          my $rescont = decode_json($res->{'content'});
+          my $errcode = $rescont->{'error'}{'code'};
+          my $errmsg = $rescont->{'error'}{'message'};
+          AE::log error => "- - $vehicleid $ptag msg gcm error $errcode on $pushkeyvalue: $errmsg";
+          # App instance unregistered from FCM?
+          # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+          if ($errcode == 403 || $errcode == 404)
+            {
+            AE::log info => "- - $vehicleid $ptag msg gcm unregister $appid (error $errcode $errmsg)";
+            $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
+                    undef, $vehicleid, $appid);
+            }
           }
+        catch
+          {
+          AE::log error => "- - $vehicleid $ptag msg gcm caught error: $_";
+          };
         }
       }
     # exit child process
@@ -1891,12 +1899,18 @@ sub gcm_tim
   else
     {
     # we're the main process
-    $gcm_running = AnyEvent->child (pid => $pid, cb => sub
-      {
-      AE::log info => "- - - msg gcm processing finished";
-      undef $gcm_running;
-      }
-    );
+    AE::log debug => "- - - msg gcm forked pid=$pid";
+    # register callback for child process done
+    $gcm_running = AnyEvent->child
+      (
+      pid => $pid,
+      cb => sub
+        {
+        AE::log info => "- - - msg gcm processing finished pid=$pid";
+        undef $gcm_running;
+        }
+      );
+    # queue has been copied by fork(), clear in main process:
     @gcm_queue = ();
     }
   }
