@@ -8,6 +8,7 @@ use AnyEvent::Handle;
 use AnyEvent::Socket;
 use AnyEvent::HTTP;
 use AnyEvent::HTTPD;
+use AnyEvent::Util;
 use IO::Handle;
 use Net::SSLeay;
 use IO::Socket::SSL;
@@ -41,7 +42,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.11.2-20240304";
+my $VERSION = "2.11.3-20240317";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -66,7 +67,7 @@ my @apns_queue;
 my $apns_handle;
 my $apns_running=0;
 my @gcm_queue;
-my $gcm_running;
+my $gcm_running=0;
 my @mail_queue;
 
 # Auto-flush
@@ -127,6 +128,7 @@ my $dbtim = AnyEvent->timer (after => 60, interval => 60, cb => \&db_tim);
 my $apnstim = AnyEvent->timer (after => 1, interval => 1, cb => \&apns_tim);
 
 # Google push notifications connection:
+#$AnyEvent::Util::MAX_FORKS = 1; # $config->val('gcm','max_forks',1);
 my $gcm_api_key_file = $config->val('gcm','api_key_file');
 my $gcm_project_id;
 my $gcm_api_key_json;
@@ -1818,34 +1820,31 @@ sub apns_tim
 sub gcm_tim
   {
   return if (!defined $gcm_con);
-  return if (defined $gcm_running);
+  return if ($gcm_running == 1);
   return if (scalar @gcm_queue == 0);
 
   # WWW::FCM::HTTP::V1->send() is synchronous, needs ~0.3 seconds per call.
   # Fork child process for asynchronous push message delivery:
-  my $pid = fork;
-  if (!defined $pid)
-    {
-    AE::log error => "- - - msg gcm processing: fatal: cannot create child process";
-    return;
-    }
+  #$AnyEvent::Util::MAX_FORKS = 1;
 
-  if ($pid == 0)
-    {
-    # we're the child process
-    my $ptag = "[pid=" . $$ . "]";
-    AE::log info => "- - - $ptag msg gcm processing queue: " . scalar @gcm_queue . " messages";
+  my $ptag = "[pid=" . $$ . "]";
+  AE::log info => "- - - $ptag msg gcm processing queue: " . scalar @gcm_queue . " messages";
 
-    foreach my $rec (@gcm_queue)
+  if (my $rec = pop(@gcm_queue))
+    {
+    my $vehicleid = $rec->{'vehicleid'};
+    my $alerttype = $rec->{'alerttype'};
+    my $alertmsg = $rec->{'alertmsg'};
+    my $timestamp = $rec->{'timestamp'};
+    my $pushkeyvalue = $rec->{'pushkeyvalue'};
+    my $appid = $rec->{'appid'};
+    AE::log info => "- - $vehicleid $ptag msg gcm '$alertmsg' => $pushkeyvalue";
+
+    $gcm_running = 1;
+
+    fork_call
       {
-      my $vehicleid = $rec->{'vehicleid'};
-      my $alerttype = $rec->{'alerttype'};
-      my $alertmsg = $rec->{'alertmsg'};
-      my $timestamp = $rec->{'timestamp'};
-      my $pushkeyvalue = $rec->{'pushkeyvalue'};
-      my $appid = $rec->{'appid'};
-      AE::log debug => "- - $vehicleid $ptag msg gcm '$alertmsg' => $pushkeyvalue";
-
+      #print "fork_call pid=" . $$ . "\n";
       my $res = $gcm_con->send(
         {
         message =>
@@ -1864,14 +1863,19 @@ sub gcm_tim
             },
           },
         });
-
+      return $res;
+      }
+    sub
+      {
+      #print "fork_call result pid=" . $$ . "\n";
+      my $res = shift;
       if ($res->is_success)
         {
-        AE::log debug => "- - $vehicleid $ptag msg gcm message sent to $pushkeyvalue";
+        AE::log info => "- - $vehicleid $ptag msg gcm message sent to $pushkeyvalue";
         }
       else
         {
-        AE::log debug => "- - $vehicleid $ptag msg gcm failure response: " . $res->{'content'};
+        AE::log info => "- - $vehicleid $ptag msg gcm failure response: " . $res->{'content'};
         try
           {
           my $rescont = decode_json($res->{'content'});
@@ -1892,27 +1896,12 @@ sub gcm_tim
           AE::log error => "- - $vehicleid $ptag msg gcm caught error: $_";
           };
         }
+      
+      $gcm_running = 0;
+      &gcm_tim;
       }
-    # exit child process
-    exit 0;
     }
-  else
-    {
-    # we're the main process
-    AE::log debug => "- - - msg gcm forked pid=$pid";
-    # register callback for child process done
-    $gcm_running = AnyEvent->child
-      (
-      pid => $pid,
-      cb => sub
-        {
-        AE::log info => "- - - msg gcm processing finished pid=$pid";
-        undef $gcm_running;
-        }
-      );
-    # queue has been copied by fork(), clear in main process:
-    @gcm_queue = ();
-    }
+  
   }
 
 sub mail_tim
