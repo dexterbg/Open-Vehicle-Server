@@ -42,7 +42,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.11.3-20240317";
+my $VERSION = "2.11.4-20240408";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -166,16 +166,15 @@ if (defined $gcm_api_key_json)
 if (defined $gcm_project_id)
   {
   $gcm_api_url = "https://fcm.googleapis.com/v1/projects/$gcm_project_id/messages:send";
-  $gcm_con = WWW::FCM::HTTP::V1->new(
-    {
-    api_url      => $gcm_api_url,
-    api_key_json => $gcm_api_key_json,
-    });
+  &gcm_init_con;
   }
 
 # Google push notifications ticker:
 my $gcm_interval = $config->val('gcm','interval',10);
 my $gcmtim = AnyEvent->timer (after => $gcm_interval, interval => $gcm_interval, cb => \&gcm_tim);
+# Google connection reinit ticker:
+my $gcm_interval_reinit = $config->val('gcm','interval_reinit',3600);
+my $gcmtim_reinit = AnyEvent->timer (after => $gcm_interval_reinit, interval => $gcm_interval_reinit, cb => \&gcm_init_con);
 
 # Mail push notifications ticker:
 my $mail_enabled = $config->val('mail','enabled',0);
@@ -1817,6 +1816,21 @@ sub apns_tim
     }
   }
 
+sub gcm_init_con
+  {
+  if (defined $gcm_con)
+    {
+    undef $gcm_con;
+    }
+  $gcm_con = WWW::FCM::HTTP::V1->new(
+    {
+    api_url      => $gcm_api_url,
+    api_key_json => $gcm_api_key_json,
+    });
+  AE::log info => "- - - msg gcm connection initialized: " . $gcm_con;
+  }
+
+
 sub gcm_tim
   {
   return if (!defined $gcm_con);
@@ -1825,10 +1839,8 @@ sub gcm_tim
 
   # WWW::FCM::HTTP::V1->send() is synchronous, needs ~0.3 seconds per call.
   # Fork child process for asynchronous push message delivery:
-  #$AnyEvent::Util::MAX_FORKS = 1;
 
-  my $ptag = "[pid=" . $$ . "]";
-  AE::log info => "- - - $ptag msg gcm processing queue: " . scalar @gcm_queue . " messages";
+  AE::log info => "- - - msg gcm processing queue: " . scalar @gcm_queue . " messages";
 
   if (my $rec = pop(@gcm_queue))
     {
@@ -1838,7 +1850,7 @@ sub gcm_tim
     my $timestamp = $rec->{'timestamp'};
     my $pushkeyvalue = $rec->{'pushkeyvalue'};
     my $appid = $rec->{'appid'};
-    AE::log info => "- - $vehicleid $ptag msg gcm '$alertmsg' => $pushkeyvalue";
+    AE::log info => "- - $vehicleid msg gcm '$alertmsg' => $pushkeyvalue";
 
     $gcm_running = 1;
 
@@ -1869,37 +1881,42 @@ sub gcm_tim
       {
       #print "fork_call result pid=" . $$ . "\n";
       my $res = shift;
-      if ($res->is_success)
+      if (!defined $res)
         {
-        AE::log info => "- - $vehicleid $ptag msg gcm message sent to $pushkeyvalue";
+        AE::log error => "- - $vehicleid msg gcm fork_call error $!: $@";
+        }
+      elsif ($res->is_success)
+        {
+        AE::log info => "- - $vehicleid msg gcm message sent to $pushkeyvalue";
         }
       else
         {
-        AE::log info => "- - $vehicleid $ptag msg gcm failure response: " . $res->{'content'};
+        AE::log info => "- - $vehicleid msg gcm failure response: " . $res->{'content'};
         try
           {
           my $rescont = decode_json($res->{'content'});
           my $errcode = $rescont->{'error'}{'code'};
           my $errmsg = $rescont->{'error'}{'message'};
-          AE::log error => "- - $vehicleid $ptag msg gcm error $errcode on $pushkeyvalue: $errmsg";
+          AE::log error => "- - $vehicleid msg gcm error $errcode on $pushkeyvalue: $errmsg";
           # App instance unregistered from FCM?
           # see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
-          if ($errcode == 403 || $errcode == 404)
+          if ($errcode == 403 || $errcode == 404
+              || $errmsg eq "The registration token is not a valid FCM registration token")
             {
-            AE::log info => "- - $vehicleid $ptag msg gcm unregister $appid (error $errcode $errmsg)";
+            AE::log info => "- - $vehicleid msg gcm unregister $appid (error $errcode $errmsg)";
             $db->do("DELETE FROM ovms_notifies WHERE vehicleid=? AND appid=?",
                     undef, $vehicleid, $appid);
             }
           }
         catch
           {
-          AE::log error => "- - $vehicleid $ptag msg gcm caught error: $_";
+          AE::log error => "- - $vehicleid msg gcm caught error: $_";
           };
         }
       
       $gcm_running = 0;
       &gcm_tim;
-      }
+      };
     }
   
   }
