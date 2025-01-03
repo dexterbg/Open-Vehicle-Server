@@ -42,7 +42,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.12.1-20241116";
+my $VERSION = "2.12.2-20250103";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -1827,6 +1827,7 @@ sub gcm_init_con
     api_url      => $gcm_api_url,
     api_key_json => $gcm_api_key_json,
     });
+  $gcm_running = 0;
   AE::log info => "- - - msg gcm connection initialized: " . $gcm_con;
   }
 
