@@ -42,7 +42,7 @@ use constant TCP_KEEPCNT => 6;
 
 # Global Variables
 
-my $VERSION = "2.12.2-20250103";
+my $VERSION = "2.12.3-20250107";
 my $b64tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 my $itoa64 = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 my %conns;
@@ -1843,7 +1843,7 @@ sub gcm_tim
 
   AE::log info => "- - - msg gcm processing queue: " . scalar @gcm_queue . " messages";
 
-  if (my $rec = pop(@gcm_queue))
+  if (my $rec = shift(@gcm_queue))
     {
     my $vehicleid = $rec->{'vehicleid'};
     my $alerttype = $rec->{'alerttype'};
